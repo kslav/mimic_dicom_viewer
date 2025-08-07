@@ -12,6 +12,8 @@ import os
 import streamlit as st
 import boto3
 from botocore.exceptions import ClientError
+import numpy as np
+from pydicom.pixel_data_handlers.util import apply_voi_lut
 
 # --- Credentials & client bootstrap ---
 def _get_aws_creds():
@@ -91,6 +93,41 @@ def load_mapping(csv_file) -> pd.DataFrame:
     """
     return pd.read_csv(csv_file)
 
+def dicom_to_uint8(ds):
+    """Apply VOI LUT / windowing, handle MONOCHROME1, return 8-bit image."""
+    try:
+        data = apply_voi_lut(ds.pixel_array, ds)
+    except Exception:
+        data = ds.pixel_array
+
+    data = data.astype(np.float32)
+
+    # Invert if MONOCHROME1 (black/white reversed)
+    if ds.get("PhotometricInterpretation", "").upper() == "MONOCHROME1":
+        data = data.max() - data
+
+    # Use WindowCenter/WindowWidth if available
+    wc = ds.get("WindowCenter")
+    ww = ds.get("WindowWidth")
+    # Handle MultiValue
+    if isinstance(wc, (list, tuple)) or getattr(wc, "__len__", None):
+        wc = float(wc[0])
+    if isinstance(ww, (list, tuple)) or getattr(ww, "__len__", None):
+        ww = float(ww[0])
+
+    if wc is not None and ww:
+        lo = wc - ww / 2.0
+        hi = wc + ww / 2.0
+        data = np.clip(data, lo, hi)
+        data = (data - lo) / max(hi - lo, 1e-6)
+    else:
+        # Fallback to min-max
+        data = data - data.min()
+        denom = data.max()
+        data = data / denom if denom > 0 else data
+
+    img8 = (data * 255.0).clip(0, 255).astype(np.uint8)
+    return img8
 
 # ——— ❸ Streamlit UI ———
 def main():
@@ -140,9 +177,8 @@ def main():
             obj = s3.get_object(Bucket=bucket, Key=key)
             dicom_bytes = obj["Body"].read()
             ds = pydicom.dcmread(io.BytesIO(dicom_bytes))
-            img = ds.pixel_array
-
-            st.image(img, caption=key.split("/")[-1], use_column_width=True)
+            img = dicom_to_uint8(ds)
+            st.image(img, caption=key.split("/")[-1], use_container_width=True)
 
     st.success("Done!")
 
