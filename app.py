@@ -166,12 +166,12 @@ def main():
             bucket, key = parse_s3_uri(uri)
 
             # ❹ Presigned download link
-            url = generate_presigned_url(bucket, key)
-            if url:
-                st.markdown(f"- [Download raw DICOM]({url})")
-            else:
-                st.warning(f"- Could not generate link for {uri}")
-                continue
+            #url = generate_presigned_url(bucket, key)
+            #if url:
+            #    st.markdown(f"- [Download raw DICOM]({url})")
+            #else:
+            #    st.warning(f"- Could not generate link for {uri}")
+            #    continue
 
             # ❺ Preview in-stream
             obj = s3.get_object(Bucket=bucket, Key=key)
