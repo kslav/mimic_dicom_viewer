@@ -72,6 +72,7 @@ def generate_presigned_url(bucket: str, key: str) -> str:
     """
     Return a presigned GET URL for the S3 object, or empty string on error.
     """
+    EXPIRATION = int(os.getenv("PRESIGN_TTL", "3600"))  # 1 hour default
     try:
         return s3.generate_presigned_url(
             "get_object",
