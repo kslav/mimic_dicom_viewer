@@ -8,14 +8,53 @@ import streamlit as st
 import pandas as pd
 import boto3
 import pydicom
+import os
+import streamlit as st
+import boto3
 from botocore.exceptions import ClientError
 
-# ——— ❶ Configuration ———
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-EXPIRATION = 3600  # presigned URL valid for 1 hour
+# --- Credentials & client bootstrap ---
+def _get_aws_creds():
+    # Prefer Streamlit Secrets; fall back to env. Strip whitespace just in case.
+    ak = (st.secrets.get("AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID") or "").strip()
+    sk = (st.secrets.get("AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY") or "").strip()
+    tk = (st.secrets.get("AWS_SESSION_TOKEN") or os.getenv("AWS_SESSION_TOKEN") or "").strip()  # optional
+    rg = (st.secrets.get("AWS_REGION") or os.getenv("AWS_REGION") or "us-east-1").strip()
+    return ak, sk, tk, rg
 
-# Create an S3 client once
-s3 = boto3.client("s3", region_name=AWS_REGION)
+AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION = _get_aws_creds()
+
+# Minimal debug (safe/temporary): show presence and shapes, not the secrets.
+with st.expander("Debug: AWS creds (safe view)"):
+    def mask(x): 
+        return f"{x[:4]}...{x[-4:]} (len={len(x)})" if x else "MISSING"
+    st.write({
+        "AWS_ACCESS_KEY_ID": mask(AWS_ACCESS_KEY_ID),
+        "AWS_SECRET_ACCESS_KEY": f"(len={len(AWS_SECRET_ACCESS_KEY)})" if AWS_SECRET_ACCESS_KEY else "MISSING",
+        "AWS_SESSION_TOKEN": "present" if AWS_SESSION_TOKEN else "absent",
+        "AWS_REGION": AWS_REGION,
+    })
+
+if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
+    st.error("AWS credentials not found. Check Streamlit Secrets (or env vars).")
+    st.stop()
+
+# Build a session explicitly from the values above
+session = boto3.Session(
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    aws_session_token=(AWS_SESSION_TOKEN or None),
+    region_name=AWS_REGION,
+)
+s3 = session.client("s3")
+
+# Optional: STS sanity check to catch invalid/expired keys early
+try:
+    ident = session.client("sts").get_caller_identity()
+    st.caption(f"STS OK: account {ident['Account']} • {ident['Arn']}")
+except ClientError as e:
+    st.error(f"STS check failed: {e}")
+    st.stop()
 
 
 # ——— ❷ Helpers ———
