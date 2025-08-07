@@ -220,7 +220,7 @@ def main():
         return
 
     st.write(f"Loaded {len(df)} rows. Preview:")
-    st.dataframe(df.head())
+    st.success(f"✅ Loaded {df['STUDYID'].nunique()} unique study IDs.")
 
     # ❸ Iterate by STUDYID
     for sid, group in df.groupby("STUDYID"):
