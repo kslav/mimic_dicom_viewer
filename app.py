@@ -201,7 +201,7 @@ def main():
     st.markdown(
         """
         Upload a CSV mapping STUDYID → S3_PATH (full s3://… URIs).  
-        The app will generate download links and render a preview of each DICOM.
+        The app will render a preview of each DICOM.
         """
     )
 
