@@ -14,6 +14,106 @@ import boto3
 from botocore.exceptions import ClientError
 import numpy as np
 from pydicom.pixel_data_handlers.util import apply_voi_lut
+from typing import Tuple
+
+# ------ DICOM HELPERS ------
+def first_value(x):
+    # DICOM WindowCenter/Width can be MultiValue
+    try:
+        return float(x[0])
+    except Exception:
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+def read_dicom_from_s3(bucket: str, key: str, s3_client) -> Tuple["pydicom.Dataset", np.ndarray]:
+    obj = s3_client.get_object(Bucket=bucket, Key=key)
+    ds = pydicom.dcmread(io.BytesIO(obj["Body"].read()))
+    arr = ds.pixel_array.astype(np.float32)
+
+    # Apply rescale to get physical units (e.g., HU) if present
+    slope = float(getattr(ds, "RescaleSlope", 1.0))
+    intercept = float(getattr(ds, "RescaleIntercept", 0.0))
+    arr = arr * slope + intercept
+    return ds, arr
+
+def window_to_float01(arr: np.ndarray, center: float, width: float, invert: bool) -> np.ndarray:
+    lo = center - width / 2.0
+    hi = center + width / 2.0
+    out = (arr - lo) / max(hi - lo, 1e-6)
+    out = np.clip(out, 0.0, 1.0)
+    if invert:
+        out = 1.0 - out
+    return out  # float in [0,1] — perfect for st.image
+
+def dicom_to_uint8(ds):
+    """Apply VOI LUT / windowing, handle MONOCHROME1, return 8-bit image."""
+    try:
+        data = apply_voi_lut(ds.pixel_array, ds)
+    except Exception:
+        data = ds.pixel_array
+
+    data = data.astype(np.float32)
+
+    # Invert if MONOCHROME1 (black/white reversed)
+    if ds.get("PhotometricInterpretation", "").upper() == "MONOCHROME1":
+        data = data.max() - data
+
+    # Use WindowCenter/WindowWidth if available
+    wc = ds.get("WindowCenter")
+    ww = ds.get("WindowWidth")
+    # Handle MultiValue
+    if isinstance(wc, (list, tuple)) or getattr(wc, "__len__", None):
+        wc = float(wc[0])
+    if isinstance(ww, (list, tuple)) or getattr(ww, "__len__", None):
+        ww = float(ww[0])
+
+    if wc is not None and ww:
+        lo = wc - ww / 2.0
+        hi = wc + ww / 2.0
+        data = np.clip(data, lo, hi)
+        data = (data - lo) / max(hi - lo, 1e-6)
+    else:
+        # Fallback to min-max
+        data = data - data.min()
+        denom = data.max()
+        data = data / denom if denom > 0 else data
+
+    img8 = (data * 255.0).clip(0, 255).astype(np.uint8)
+    return img8
+
+# ---- GUI helpers ----
+def first_value(x):
+    if x is None:
+        return None
+    try:
+        return float(x[0])  # DICOM MultiValue
+    except Exception:
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+def pick_defaults(ds, arr):
+    """Choose default WC/WW from DICOM tags if present, else robust percentiles; detect MONOCHROME1."""
+    wc = first_value(getattr(ds, "WindowCenter", None))
+    ww = first_value(getattr(ds, "WindowWidth", None))
+
+    # Fallback if missing or invalid
+    if wc is None or ww is None or ww <= 0:
+        vmin, vmax = np.percentile(arr, [0.5, 99.5])
+        wc = float((vmin + vmax) / 2.0)
+        ww = float(max(vmax - vmin, 1.0))
+
+    invert_default = (getattr(ds, "PhotometricInterpretation", "").upper() == "MONOCHROME1")
+    return wc, ww, invert_default
+
+def slider_bounds(arr):
+    """Give sane slider limits around the signal range."""
+    vmin, vmax = np.percentile(arr, [0.5, 99.5])
+    pad = 0.2 * max(vmax - vmin, 1.0)
+    return float(vmin - pad), float(vmax + pad)
 
 # --- Credentials & client bootstrap ---
 def _get_aws_creds():
@@ -93,41 +193,7 @@ def load_mapping(csv_file) -> pd.DataFrame:
     """
     return pd.read_csv(csv_file)
 
-def dicom_to_uint8(ds):
-    """Apply VOI LUT / windowing, handle MONOCHROME1, return 8-bit image."""
-    try:
-        data = apply_voi_lut(ds.pixel_array, ds)
-    except Exception:
-        data = ds.pixel_array
 
-    data = data.astype(np.float32)
-
-    # Invert if MONOCHROME1 (black/white reversed)
-    if ds.get("PhotometricInterpretation", "").upper() == "MONOCHROME1":
-        data = data.max() - data
-
-    # Use WindowCenter/WindowWidth if available
-    wc = ds.get("WindowCenter")
-    ww = ds.get("WindowWidth")
-    # Handle MultiValue
-    if isinstance(wc, (list, tuple)) or getattr(wc, "__len__", None):
-        wc = float(wc[0])
-    if isinstance(ww, (list, tuple)) or getattr(ww, "__len__", None):
-        ww = float(ww[0])
-
-    if wc is not None and ww:
-        lo = wc - ww / 2.0
-        hi = wc + ww / 2.0
-        data = np.clip(data, lo, hi)
-        data = (data - lo) / max(hi - lo, 1e-6)
-    else:
-        # Fallback to min-max
-        data = data - data.min()
-        denom = data.max()
-        data = data / denom if denom > 0 else data
-
-    img8 = (data * 255.0).clip(0, 255).astype(np.uint8)
-    return img8
 
 # ——— ❸ Streamlit UI ———
 def main():
@@ -160,25 +226,42 @@ def main():
     for sid, group in df.groupby("STUDYID"):
         st.header(f"Study ID: {sid}")
 
-        # If multiple rows per STUDYID, loop through them
-        for idx, row in group.iterrows():
+        for _, row in group.iterrows():
             uri = row["S3_PATH"]
             bucket, key = parse_s3_uri(uri)
 
-            # ❹ Presigned download link
-            #url = generate_presigned_url(bucket, key)
-            #if url:
-            #    st.markdown(f"- [Download raw DICOM]({url})")
-            #else:
-            #    st.warning(f"- Could not generate link for {uri}")
-            #    continue
+            # Load DICOM + defaults
+            ds, arr = read_dicom_from_s3(bucket, key, s3)
+            wc_default, ww_default, invert_default = pick_defaults(ds, arr)
 
-            # ❺ Preview in-stream
-            obj = s3.get_object(Bucket=bucket, Key=key)
-            dicom_bytes = obj["Body"].read()
-            ds = pydicom.dcmread(io.BytesIO(dicom_bytes))
-            img = dicom_to_uint8(ds)
-            st.image(img, caption=key.split("/")[-1], use_container_width=True)
+            # Sliders + controls (unique keys per object)
+            vmin, vmax = slider_bounds(arr)
+            c1, c2, c3, c4 = st.columns([1.2, 1.2, 0.8, 0.6])
+            wc = c1.slider(
+                "Window center",
+                min_value=vmin, max_value=vmax,
+                value=float(wc_default), key=f"wc_{key}"
+            )
+            ww = c2.slider(
+                "Window width",
+                min_value=1.0, max_value=float(max(arr.max() - arr.min(), ww_default*2)),
+                value=float(max(ww_default, 1.0)), key=f"ww_{key}"
+            )
+            invert = c3.checkbox("Invert", value=invert_default, key=f"invert_{key}")
+            if c4.button("Reset", key=f"reset_{key}"):
+                st.session_state[f"wc_{key}"] = float(wc_default)
+                st.session_state[f"ww_{key}"] = float(max(ww_default, 1.0))
+                st.session_state[f"invert_{key}"] = invert_default
+                st.experimental_rerun()
+
+            # Compute the view (float [0,1]) and display
+            view = window_to_float01(arr, wc, ww, invert)
+            st.image(
+                view,
+                caption=key.split("/")[-1],
+                use_container_width=True,
+                clamp=True,  # safe since view is in [0,1]
+            )
 
     st.success("Done!")
 
